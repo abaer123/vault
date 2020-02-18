@@ -3,6 +3,7 @@ package kubernetes
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 
 	"github.com/hashicorp/go-hclog"
@@ -40,7 +41,7 @@ func NewServiceRegistration(config map[string]string, logger hclog.Logger, state
 			logger:         logger,
 			namespace:      namespace,
 			podName:        podName,
-			patchesToRetry: make([]*client.Patch, 0),
+			patchesToRetry: make(map[string]*client.Patch),
 		},
 	}, nil
 }
@@ -59,10 +60,16 @@ func (r *serviceRegistration) Run(shutdownCh <-chan struct{}, wait *sync.WaitGro
 		return err
 	}
 	r.client = c
-	r.retryHandler.client = c
 
+	// Now that we've populated the client, we can begin using the retry handler.
+	r.retryHandler.SetInitialState(r.setInitialState)
+	r.retryHandler.Run(shutdownCh, wait, c)
+	return nil
+}
+
+func (r *serviceRegistration) setInitialState() error {
 	// Verify that the pod exists and our configuration looks good.
-	pod, err := c.GetPod(r.namespace, r.podName)
+	pod, err := r.client.GetPod(r.namespace, r.podName)
 	if err != nil {
 		return err
 	}
@@ -73,18 +80,18 @@ func (r *serviceRegistration) Run(shutdownCh <-chan struct{}, wait *sync.WaitGro
 		return fmt.Errorf("no pod metadata on %+v", pod)
 	}
 	if pod.Metadata.Labels == nil {
-		// Add the labels field, and the labels as part of that one call.
+		// Notify the labels field, and the labels as part of that one call.
 		// The reason we must take a different approach to adding them is discussed here:
 		// https://stackoverflow.com/questions/57480205/error-while-applying-json-patch-to-kubernetes-custom-resource
-		if err := c.PatchPod(r.namespace, r.podName, &client.Patch{
+		if err := r.client.PatchPod(r.namespace, r.podName, &client.Patch{
 			Operation: client.Add,
 			Path:      "/metadata/labels",
 			Value: map[string]string{
 				labelVaultVersion: r.initialState.VaultVersion,
-				labelActive:       toString(r.initialState.IsActive),
-				labelSealed:       toString(r.initialState.IsSealed),
-				labelPerfStandby:  toString(r.initialState.IsPerformanceStandby),
-				labelInitialized:  toString(r.initialState.IsInitialized),
+				labelActive:       strconv.FormatBool(r.initialState.IsActive),
+				labelSealed:       strconv.FormatBool(r.initialState.IsSealed),
+				labelPerfStandby:  strconv.FormatBool(r.initialState.IsPerformanceStandby),
+				labelInitialized:  strconv.FormatBool(r.initialState.IsInitialized),
 			},
 		}); err != nil {
 			return err
@@ -100,119 +107,64 @@ func (r *serviceRegistration) Run(shutdownCh <-chan struct{}, wait *sync.WaitGro
 			{
 				Operation: client.Replace,
 				Path:      pathToLabels + labelActive,
-				Value:     toString(r.initialState.IsActive),
+				Value:     strconv.FormatBool(r.initialState.IsActive),
 			},
 			{
 				Operation: client.Replace,
 				Path:      pathToLabels + labelSealed,
-				Value:     toString(r.initialState.IsSealed),
+				Value:     strconv.FormatBool(r.initialState.IsSealed),
 			},
 			{
 				Operation: client.Replace,
 				Path:      pathToLabels + labelPerfStandby,
-				Value:     toString(r.initialState.IsPerformanceStandby),
+				Value:     strconv.FormatBool(r.initialState.IsPerformanceStandby),
 			},
 			{
 				Operation: client.Replace,
 				Path:      pathToLabels + labelInitialized,
-				Value:     toString(r.initialState.IsInitialized),
+				Value:     strconv.FormatBool(r.initialState.IsInitialized),
 			},
 		}
-		if err := c.PatchPod(r.namespace, r.podName, patches...); err != nil {
+		if err := r.client.PatchPod(r.namespace, r.podName, patches...); err != nil {
 			return err
 		}
 	}
-
-	// Run a service that retries errored-out notifications if they occur.
-	go r.retryHandler.Run(shutdownCh, wait)
-
-	// Run a background goroutine to leave labels in the final state we'd like
-	// when Vault shuts down.
-	go r.onShutdown(shutdownCh, wait)
-
 	return nil
 }
 
 func (r *serviceRegistration) NotifyActiveStateChange(isActive bool) error {
-	return r.notifyOrRetry(&client.Patch{
+	r.retryHandler.Notify(r.client, &client.Patch{
 		Operation: client.Replace,
 		Path:      pathToLabels + labelActive,
-		Value:     toString(isActive),
+		Value:     strconv.FormatBool(isActive),
 	})
+	return nil
 }
 
 func (r *serviceRegistration) NotifySealedStateChange(isSealed bool) error {
-	return r.notifyOrRetry(&client.Patch{
+	r.retryHandler.Notify(r.client, &client.Patch{
 		Operation: client.Replace,
 		Path:      pathToLabels + labelSealed,
-		Value:     toString(isSealed),
+		Value:     strconv.FormatBool(isSealed),
 	})
+	return nil
 }
 
 func (r *serviceRegistration) NotifyPerformanceStandbyStateChange(isStandby bool) error {
-	return r.notifyOrRetry(&client.Patch{
+	r.retryHandler.Notify(r.client, &client.Patch{
 		Operation: client.Replace,
 		Path:      pathToLabels + labelPerfStandby,
-		Value:     toString(isStandby),
+		Value:     strconv.FormatBool(isStandby),
 	})
+	return nil
 }
 
 func (r *serviceRegistration) NotifyInitializedStateChange(isInitialized bool) error {
-	return r.notifyOrRetry(&client.Patch{
+	r.retryHandler.Notify(r.client, &client.Patch{
 		Operation: client.Replace,
 		Path:      pathToLabels + labelInitialized,
-		Value:     toString(isInitialized),
+		Value:     strconv.FormatBool(isInitialized),
 	})
-}
-
-func (r *serviceRegistration) onShutdown(shutdownCh <-chan struct{}, wait *sync.WaitGroup) {
-	// Make sure Vault will give us time to finish up here.
-	wait.Add(1)
-	defer wait.Done()
-
-	// Start running this when we receive a shutdown.
-	<-shutdownCh
-
-	// Label the pod with the values we want to leave behind after shutdown.
-	patches := []*client.Patch{
-		{
-			Operation: client.Replace,
-			Path:      pathToLabels + labelActive,
-			Value:     toString(false),
-		},
-		{
-			Operation: client.Replace,
-			Path:      pathToLabels + labelSealed,
-			Value:     toString(true),
-		},
-		{
-			Operation: client.Replace,
-			Path:      pathToLabels + labelPerfStandby,
-			Value:     toString(false),
-		},
-		{
-			Operation: client.Replace,
-			Path:      pathToLabels + labelInitialized,
-			Value:     toString(false),
-		},
-	}
-	if err := r.client.PatchPod(r.namespace, r.podName, patches...); err != nil {
-		if r.logger.IsError() {
-			r.logger.Error(fmt.Sprintf("unable to set final status on pod name %q in namespace %q on shutdown: %s", r.podName, r.namespace, err))
-		}
-		return
-	}
-}
-
-func (r *serviceRegistration) notifyOrRetry(patch *client.Patch) error {
-	if err := r.client.PatchPod(r.namespace, r.podName, patch); err != nil {
-		if r.logger.IsWarn() {
-			r.logger.Warn("unable to update state due to %s, will retry", err.Error())
-		}
-		if err := r.retryHandler.Add(patch); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -230,9 +182,4 @@ func getRequiredField(logger hclog.Logger, config map[string]string, envVar, con
 		logger.Debug(fmt.Sprintf("%q: %q", configParam, value))
 	}
 	return value, nil
-}
-
-// Converts a bool to "true" or "false".
-func toString(b bool) string {
-	return fmt.Sprintf("%t", b)
 }

@@ -56,8 +56,8 @@ func (e *env) TestGetPodNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error because pod is unfound")
 	}
-	if err != ErrNotFound {
-		t.Fatalf("expected %q but received %q", ErrNotFound, err)
+	if _, ok := err.(*ErrNotFound); !ok {
+		t.Fatalf("expected *ErrNotFound but received %T", err)
 	}
 }
 
@@ -73,7 +73,10 @@ func (e *env) TestUpdatePodTags(t *testing.T) {
 		t.Fatalf("expected 1 label but received %+v", e.testState)
 	}
 	if e.testState.Get("/metadata/labels/fizz")["value"] != "buzz" {
-		t.Fatalf("expected buzz but received %q", e.testState.Get("fizz"))
+		t.Fatalf("expected buzz but received %q", e.testState.Get("fizz")["value"])
+	}
+	if e.testState.Get("/metadata/labels/fizz")["op"] != "add" {
+		t.Fatalf("expected add but received %q", e.testState.Get("fizz")["op"])
 	}
 }
 
@@ -86,7 +89,7 @@ func (e *env) TestUpdatePodTagsNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error because pod is unfound")
 	}
-	if err != ErrNotFound {
-		t.Fatalf("expected %q but received %q", ErrNotFound, err)
+	if _, ok := err.(*ErrNotFound); !ok {
+		t.Fatalf("expected *ErrNotFound but received %T", err)
 	}
 }

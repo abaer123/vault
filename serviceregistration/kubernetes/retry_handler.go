@@ -2,7 +2,6 @@ package kubernetes
 
 import (
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -19,94 +18,114 @@ type retryHandler struct {
 	// These don't need a mutex because they're never mutated.
 	logger             hclog.Logger
 	namespace, podName string
-	client             *client.Client
 
-	// This gets mutated on multiple threads.
-	patchesToRetry     []*client.Patch
-	patchesToRetryLock sync.Mutex
+	// To synchronize setInitialState and patchesToRetry.
+	lock sync.Mutex
+
+	// setInitialState will be nil if this has been done successfully.
+	// It must be done before any patches are retried.
+	setInitialState func() error
+
+	// The map holds the path to the label being updated. It will only either
+	// not hold a particular label, or hold _the last_ state we were aware of.
+	// These should only be updated after initial state has been set.
+	patchesToRetry map[string]*client.Patch
 }
 
-// Run runs at an interval, checking if anything has failed and if so,
-// attempting to send them again.
-func (r *retryHandler) Run(shutdownCh <-chan struct{}, wait *sync.WaitGroup) {
-	// Make sure Vault will give us time to finish up here.
-	wait.Add(1)
-	defer wait.Done()
-
-	retry := time.NewTicker(retryFreq)
-	for {
-		select {
-		case <-shutdownCh:
-			return
-		case <-retry.C:
-			r.retry()
+func (r *retryHandler) SetInitialState(setInitialState func() error) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if err := setInitialState(); err != nil {
+		if r.logger.IsWarn() {
+			r.logger.Warn(fmt.Sprintf("unable to set initial state due to %s, will retry", err.Error()))
 		}
+		r.setInitialState = setInitialState
 	}
 }
 
-// Add adds a patch to be retried until it's either completed without
+// Run must be called for retries to be started.
+func (r *retryHandler) Run(shutdownCh <-chan struct{}, wait *sync.WaitGroup, c *client.Client) {
+	// Run this in a go func so this call doesn't block.
+	go func() {
+		// Make sure Vault will give us time to finish up here.
+		wait.Add(1)
+		defer wait.Done()
+
+		retry := time.NewTicker(retryFreq)
+		defer retry.Stop()
+		for {
+			select {
+			case <-shutdownCh:
+				return
+			case <-retry.C:
+				r.retry(c)
+			}
+		}
+	}()
+}
+
+// Notify adds a patch to be retried until it's either completed without
 // error, or no longer needed.
-func (r *retryHandler) Add(patch *client.Patch) error {
-	r.patchesToRetryLock.Lock()
-	defer r.patchesToRetryLock.Unlock()
+func (r *retryHandler) Notify(c *client.Client, patch *client.Patch) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
 
-	// - If the patch is a dupe, don't add it.
-	// - If the patch reverts another, remove them both.
-	//     For example, perhaps we were already retrying "active = true",
-	//     but this new patch tells us "active = false" again.
-	// - Otherwise, this is a new, unique patch, so add this patch to retries.
-	for i := 0; i < len(r.patchesToRetry); i++ {
-		prevPatch := r.patchesToRetry[i]
-		if patch.Path != prevPatch.Path {
-			continue
+	// Initial state must be set first, or subsequent notifications we've
+	// received could get smashed by a late-arriving initial state.
+	// We will store this to retry it when appropriate.
+	if r.setInitialState != nil {
+		if r.logger.IsWarn() {
+			r.logger.Warn(fmt.Sprintf("cannot notify of present state for %s because initial state is unset", patch.Path))
 		}
-		if patch.Operation != prevPatch.Operation {
-			continue
-		}
-		// These patches are operating upon the same thing.
-		// Let's look at what they're trying to do to determine
-		// the right action to take with the incoming patch.
-		patchValStr, ok := patch.Value.(string)
-		if !ok {
-			return fmt.Errorf("all patches must have bool values but received %+x", patch)
-		}
-		patchVal, err := strconv.ParseBool(patchValStr)
-		if err != nil {
-			return err
-		}
-		// This was already verified to be a bool string
-		// when it was added to the slice.
-		prevPatchVal, _ := strconv.ParseBool(prevPatch.Value.(string))
-		if patchVal == prevPatchVal {
-			// We don't need to add the new patch because it already exists.
-			// Nothing further to do here.
-			return nil
-		} else {
-			// Rather than doing both an add and a subtract, or a true and a false,
-			// we need to just not act on both. This requires not adding the new patch,
-			// and removing the previous conflicting patch.
-			r.patchesToRetry = append(r.patchesToRetry[:i], r.patchesToRetry[i+1:]...)
-			return nil
-		}
+		r.patchesToRetry[patch.Path] = patch
+		return
 	}
-	r.patchesToRetry = append(r.patchesToRetry, patch)
-	return nil
+
+	// Initial state has been sent, so it's OK to attempt a patch immediately.
+	if err := c.PatchPod(r.namespace, r.podName, patch); err != nil {
+		if r.logger.IsWarn() {
+			r.logger.Warn(fmt.Sprintf("unable to update state for %s due to %s, will retry", patch.Path, err.Error()))
+		}
+		r.patchesToRetry[patch.Path] = patch
+	}
 }
 
-func (r *retryHandler) retry() {
-	r.patchesToRetryLock.Lock()
-	defer r.patchesToRetryLock.Unlock()
+func (r *retryHandler) retry(c *client.Client) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	// Initial state must be set first, or subsequent notifications we've
+	// received could get smashed by a late-arriving initial state.
+	if r.setInitialState != nil {
+		if err := r.setInitialState(); err != nil {
+			if r.logger.IsWarn() {
+				r.logger.Warn(fmt.Sprintf("unable to set initial state due to %s, will retry", err.Error()))
+			}
+			// On failure, we leave the initial state func populated for
+			// the next retry.
+			return
+		}
+		// On success, we set it to nil and allow the logic to continue.
+		r.setInitialState = nil
+	}
 
 	if len(r.patchesToRetry) == 0 {
-		// Nothing to do here.
+		// Nothing further to do here.
 		return
 	}
 
-	if err := r.client.PatchPod(r.namespace, r.podName, r.patchesToRetry...); err != nil {
+	patches := make([]*client.Patch, len(r.patchesToRetry))
+	i := 0
+	for _, patch := range r.patchesToRetry {
+		patches[i] = patch
+		i++
+	}
+
+	if err := c.PatchPod(r.namespace, r.podName, patches...); err != nil {
 		if r.logger.IsWarn() {
-			r.logger.Warn("unable to update state due to %s, will retry", err.Error())
+			r.logger.Warn(fmt.Sprintf("unable to update state for due to %s, will retry", err.Error()))
 		}
 		return
 	}
-	r.patchesToRetry = make([]*client.Patch, 0)
+	r.patchesToRetry = make(map[string]*client.Patch)
 }

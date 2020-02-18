@@ -1,7 +1,7 @@
 # How to Test Manually
 
 - `$ minikube start`
-- In the Vault folder, `$ make dev`
+- In the Vault folder, `$ make dev XC_ARCH=amd64 XC_OS=linux XC_OSARCH=linux/amd64`
 - Create a file called `vault-test.yaml` with the following contents:
 
 ```
@@ -17,15 +17,15 @@ spec:
       args:
       - while true; do
           echo -en '\n';
-          printenv VAULT_POD_NAME VAULT_NAMESPACE;
+          printenv VAULT_K8S_POD_NAME VAULT_K8S_NAMESPACE;
           sleep 10;
         done;
       env:
-        - name: VAULT_POD_NAME
+        - name: VAULT_K8S_POD_NAME
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
-        - name: VAULT_NAMESPACE
+        - name: VAULT_K8S_NAMESPACE
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
@@ -34,7 +34,7 @@ spec:
 
 - Create the pod: `$ kubectl apply -f vault-test.yaml`
 - View the full initial state of the pod: `$ kubectl get pod vault -o=yaml > initialstate.txt`
-- Drop the Vault binary into the pod: `$ kubectl cp $(which vault) /vault:/`
+- Drop the Vault binary into the pod: `$ kubectl cp bin/vault /vault:/`
 - Drop to the shell within the pod: `$ kubectl exec -it vault -- /bin/bash`
 - Install a text editor: `$ apt-get update`, `$ apt-get install nano`
 - Write a test Vault config to `vault.config` like:

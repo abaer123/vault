@@ -2,27 +2,28 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"time"
 
-	"github.com/cenkalti/backoff"
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-retryablehttp"
 )
 
-// maxRetries is the maximum number of times the client
-// should retry.
-const maxRetries = 10
-
 var (
+	// Retry configuration
+	RetryWaitMin = 500 * time.Millisecond
+	RetryWaitMax = 30 * time.Second
+	RetryMax     = 10
+
+	// Standard errs
 	ErrNamespaceUnset = errors.New(`"namespace" is unset`)
 	ErrPodNameUnset   = errors.New(`"podName" is unset`)
-	ErrNotFound       = errors.New("not found")
 	ErrNotInCluster   = errors.New("unable to load in-cluster configuration, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be defined")
 )
 
@@ -40,7 +41,11 @@ func New(logger hclog.Logger, stopCh <-chan struct{}) (*Client, error) {
 	}, nil
 }
 
-// Client is a minimal Kubernetes client.
+// Client is a minimal Kubernetes client. We rolled our own because the existing
+// Kubernetes client-go library available externally has a high number of dependencies
+// and we thought it wasn't worth it for only two API calls. If at some point they break
+// the client into smaller modules, or if we add quite a few methods to this client, it may
+// be worthwhile to revisit that decision.
 type Client struct {
 	logger hclog.Logger
 	config *Config
@@ -90,13 +95,13 @@ func (c *Client) PatchPod(namespace, podName string, patches ...*Patch) error {
 		return nil
 	}
 
-	var jsonPatches []interface{}
+	var jsonPatches []map[string]interface{}
 	for _, patch := range patches {
 		if patch.Operation == Unset {
 			return errors.New("patch operation must be set")
 		}
 		jsonPatches = append(jsonPatches, map[string]interface{}{
-			"op":    patch.Operation.String(),
+			"op":    patch.Operation,
 			"path":  patch.Path,
 			"value": patch.Value,
 		})
@@ -116,55 +121,43 @@ func (c *Client) PatchPod(namespace, podName string, patches ...*Patch) error {
 // do executes the given request, retrying if necessary.
 func (c *Client) do(req *http.Request, ptrToReturnObj interface{}) error {
 	// Finish setting up a valid request.
-	req.Header.Set("Authorization", "Bearer "+c.config.BearerToken)
-	req.Header.Set("Accept", "application/json")
-	client := cleanhttp.DefaultClient()
-	client.Transport = &http.Transport{
+	retryableReq, err := retryablehttp.FromRequest(req)
+	if err != nil {
+		return err
+	}
+
+	// Build a context that will call the cancelFunc when we receive
+	// a stop from our stopChan. This allows us to exit from our retry
+	// loop during a shutdown, rather than hanging.
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	go func(stopCh <-chan struct{}) {
+		<-stopCh
+		cancelFunc()
+	}(c.stopCh)
+	retryableReq.WithContext(ctx)
+
+	retryableReq.Header.Set("Authorization", "Bearer "+c.config.BearerToken)
+	retryableReq.Header.Set("Accept", "application/json")
+
+	client := &retryablehttp.Client{
+		HTTPClient:   cleanhttp.DefaultClient(),
+		RetryWaitMin: RetryWaitMin,
+		RetryWaitMax: RetryWaitMax,
+		RetryMax:     RetryMax,
+		CheckRetry:   c.getCheckRetry(req),
+		Backoff:      retryablehttp.DefaultBackoff,
+	}
+	client.HTTPClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{
 			RootCAs: c.config.CACertPool,
 		},
 	}
 
-	// Execute and retry the request. This exponential backoff comes
-	// with jitter already rolled in.
-	var lastErr error
-	b := backoff.NewExponentialBackOff()
-	for i := 0; i < maxRetries; i++ {
-		if i != 0 {
-			select {
-			case <-c.stopCh:
-				return nil
-			case <-time.NewTimer(b.NextBackOff()).C:
-				// Continue to the request.
-			}
-		}
-		shouldRetry, err := c.attemptRequest(client, req, ptrToReturnObj)
-		if !shouldRetry {
-			// The error may be nil or populated depending on whether the
-			// request was successful.
-			return err
-		}
-		lastErr = err
-	}
-	return lastErr
-}
-
-// attemptRequest tries one single request. It's in its own function so each
-// response body can be closed before returning, which would read awkwardly if
-// executed in a loop.
-func (c *Client) attemptRequest(client *http.Client, req *http.Request, ptrToReturnObj interface{}) (shouldRetry bool, err error) {
-	// Preserve the original request body so it can be viewed for debugging if needed.
-	// Reading it empties it, so we need to re-add it afterwards.
-	var reqBody []byte
-	if req.Body != nil {
-		reqBody, _ = ioutil.ReadAll(req.Body)
-		reqBodyReader := bytes.NewReader(reqBody)
-		req.Body = ioutil.NopCloser(reqBodyReader)
-	}
-
-	resp, err := client.Do(req)
+	// Execute and retry the request. This client comes with exponential backoff and
+	// jitter already rolled in.
+	resp, err := client.Do(retryableReq)
 	if err != nil {
-		return false, err
+		return err
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -176,42 +169,47 @@ func (c *Client) attemptRequest(client *http.Client, req *http.Request, ptrToRet
 		}
 	}()
 
-	// Check for success.
-	switch resp.StatusCode {
-	case 200, 201, 202:
-		// Pass.
-	case 401, 403:
-		// Perhaps the token from our bearer token file has been refreshed.
-		config, err := inClusterConfig()
-		if err != nil {
-			return false, err
-		}
-		if config.BearerToken == c.config.BearerToken {
-			// It's the same token.
-			return false, fmt.Errorf("bad status code: %s", sanitizedDebuggingInfo(req, reqBody, resp))
-		}
-		c.config = config
-		// Continue to try again, but return the error too in case the caller would rather read it out.
-		return true, fmt.Errorf("bad status code: %s", sanitizedDebuggingInfo(req, reqBody, resp))
-	case 404:
-		return false, ErrNotFound
-	case 500, 502, 503, 504:
-		// Could be transient.
-		return true, fmt.Errorf("unexpected status code: %s", sanitizedDebuggingInfo(req, reqBody, resp))
-	default:
-		// Unexpected.
-		return false, fmt.Errorf("unexpected status code: %s", sanitizedDebuggingInfo(req, reqBody, resp))
-	}
-
-	// We only arrive here with success.
 	// If we're not supposed to read out the body, we have nothing further
 	// to do here.
 	if ptrToReturnObj == nil {
-		return false, nil
+		return nil
 	}
 
 	// Attempt to read out the body into the given return object.
-	return false, json.NewDecoder(resp.Body).Decode(ptrToReturnObj)
+	return json.NewDecoder(resp.Body).Decode(ptrToReturnObj)
+}
+
+func (c *Client) getCheckRetry(req *http.Request) retryablehttp.CheckRetry {
+	return func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		if resp == nil {
+			return true, fmt.Errorf("nil response: %s", req.URL.RequestURI())
+		}
+		switch resp.StatusCode {
+		case 200, 201, 202, 204:
+			// Success.
+			return false, nil
+		case 401, 403:
+			// Perhaps the token from our bearer token file has been refreshed.
+			config, err := inClusterConfig()
+			if err != nil {
+				return false, err
+			}
+			if config.BearerToken == c.config.BearerToken {
+				// It's the same token.
+				return false, fmt.Errorf("bad status code: %s", sanitizedDebuggingInfo(req, resp.StatusCode))
+			}
+			c.config = config
+			// Continue to try again, but return the error too in case the caller would rather read it out.
+			return true, fmt.Errorf("bad status code: %s", sanitizedDebuggingInfo(req, resp.StatusCode))
+		case 404:
+			return false, &ErrNotFound{debuggingInfo: sanitizedDebuggingInfo(req, resp.StatusCode)}
+		case 500, 502, 503, 504:
+			// Could be transient.
+			return true, fmt.Errorf("unexpected status code: %s", sanitizedDebuggingInfo(req, resp.StatusCode))
+		}
+		// Unexpected.
+		return false, fmt.Errorf("unexpected status code: %s", sanitizedDebuggingInfo(req, resp.StatusCode))
+	}
 }
 
 type Pod struct {
@@ -227,45 +225,13 @@ type Metadata struct {
 	Labels map[string]string `json:"labels,omitempty"`
 }
 
-type PatchOperation int
+type PatchOperation string
 
 const (
-	// When adding support for more PatchOperations in the future,
-	// DO NOT alphebetize them because it will change the underlying
-	// int representing a user's intent. If that's stored anywhere,
-	// it will cause storage reads to map to the incorrect operation.
-	Unset PatchOperation = iota
-	Add
-	Replace
+	Unset   PatchOperation = "unset"
+	Add                    = "add"
+	Replace                = "replace"
 )
-
-func Parse(s string) PatchOperation {
-	switch s {
-	case "add":
-		return Add
-	case "replace":
-		return Replace
-	default:
-		return Unset
-	}
-}
-
-func (p PatchOperation) String() string {
-	switch p {
-	case Unset:
-		// This is an invalid choice, and will be shown on a patch
-		// where the PatchOperation is unset. That's because ints
-		// default to 0, and Unset corresponds to 0.
-		return "unset"
-	case Add:
-		return "add"
-	case Replace:
-		return "replace"
-	default:
-		// Should never arrive here.
-		return ""
-	}
-}
 
 type Patch struct {
 	Operation PatchOperation
@@ -273,10 +239,16 @@ type Patch struct {
 	Value     interface{}
 }
 
-// sanitizedDebuggingInfo converts an http response to a string without
-// including its headers to avoid leaking authorization
-// headers.
-func sanitizedDebuggingInfo(req *http.Request, reqBody []byte, resp *http.Response) string {
-	respBody, _ := ioutil.ReadAll(resp.Body)
-	return fmt.Sprintf("req method: %s, req url: %s, req body: %s, resp statuscode: %d, resp respBody: %s", req.Method, req.URL, reqBody, resp.StatusCode, respBody)
+type ErrNotFound struct {
+	debuggingInfo string
+}
+
+func (e *ErrNotFound) Error() string {
+	return e.debuggingInfo
+}
+
+// sanitizedDebuggingInfo provides a returnable string that can be used for debugging. This is intentionally somewhat vague
+// because we don't want to leak secrets that may be in a request or response body.
+func sanitizedDebuggingInfo(req *http.Request, respStatus int) string {
+	return fmt.Sprintf("req method: %s, req url: %s, resp statuscode: %d", req.Method, req.URL, respStatus)
 }
